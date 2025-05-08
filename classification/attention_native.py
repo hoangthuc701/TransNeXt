@@ -3,12 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-
+# Hàm hỗ trợ tính độ dài attention local và tạo padding mask để che các vùng ngoài biên
 @torch.no_grad()
 def get_seqlen_and_mask(input_resolution, window_size):
+    # Tạo bản đồ attention bằng hàm unfold (lấy vùng chồng lấn)
     attn_map = F.unfold(torch.ones([1, 1, input_resolution[0], input_resolution[1]]), window_size,
                         dilation=1, padding=(window_size // 2, window_size // 2), stride=1)
+    # Tổng số pixel thực sự được dùng trong cửa sổ attention tại mỗi vị trí
     attn_local_length = attn_map.sum(-2).squeeze().unsqueeze(-1)
+    # Tạo mask để che các vị trí padding (khi không đủ vùng cửa sổ)
     attn_mask = (attn_map.squeeze(0).permute(1, 0)) == 0
     return attn_local_length, attn_mask
 
@@ -23,23 +26,25 @@ class AggregatedAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
 
-        self.sr_ratio = sr_ratio
+        self.sr_ratio = sr_ratio  # Shrinking ratio - dùng cho pooling
 
         assert window_size % 2 == 1, "window size must be odd"
         self.window_size = window_size
-        self.local_len = window_size ** 2
+        self.local_len = window_size ** 2  # số điểm trong vùng attention local
 
+        # Tính toán kích thước vùng gộp (pooled area)
         if fixed_pool_size is None:
             self.pool_H, self.pool_W = input_resolution[0] // self.sr_ratio, input_resolution[1] // self.sr_ratio
         else:
-            assert fixed_pool_size < min(input_resolution), \
-                f"The fixed_pool_size {fixed_pool_size} should be less than the shorter side of input resolution {input_resolution} to ensure pooling works correctly."
+            assert fixed_pool_size < min(input_resolution)
             self.pool_H, self.pool_W = fixed_pool_size, fixed_pool_size
         self.pool_len = self.pool_H * self.pool_W
 
         self.unfold = nn.Unfold(kernel_size=window_size, padding=window_size // 2, stride=1)
+
+        # Nhiệt độ attention (temperature) là learnable và dương nhờ softplus
         self.temperature = nn.Parameter(
-            torch.log((torch.ones(num_heads, 1, 1) / 0.24).exp() - 1))  # Initialize softplus(temperature) to 1/0.24.
+            torch.log((torch.ones(num_heads, 1, 1) / 0.24).exp() - 1))
 
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
         self.query_embedding = nn.Parameter(
@@ -49,28 +54,28 @@ class AggregatedAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        # Components to generate pooled features.
+        # Thành phần tạo đặc trưng gộp (pooled features)
         self.pool = nn.AdaptiveAvgPool2d((self.pool_H, self.pool_W))
-        self.sr = nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0)
+        self.sr = nn.Conv2d(dim, dim, kernel_size=1)
         self.norm = nn.LayerNorm(dim)
         self.act = nn.GELU()
 
-        # mlp to generate continuous relative position bias
-        self.cpb_fc1 = nn.Linear(2, 512, bias=True)
+        # MLP tạo relative position bias liên tục
+        self.cpb_fc1 = nn.Linear(2, 512)
         self.cpb_act = nn.ReLU(inplace=True)
-        self.cpb_fc2 = nn.Linear(512, num_heads, bias=True)
+        self.cpb_fc2 = nn.Linear(512, num_heads)
 
-        # relative bias for local features
+        # Learnable relative bias cho attention local
         self.relative_pos_bias_local = nn.Parameter(
             nn.init.trunc_normal_(torch.empty(num_heads, self.local_len), mean=0, std=0.0004))
 
-        # Generate padding_mask && sequnce length scale
+        # Tính seq_length và mask cho local attention, lưu trong buffer (không học)
         local_seq_length, padding_mask = get_seqlen_and_mask(input_resolution, window_size)
         self.register_buffer("seq_length_scale", torch.as_tensor(np.log(local_seq_length.numpy() + self.pool_len)),
                              persistent=False)
         self.register_buffer("padding_mask", padding_mask, persistent=False)
 
-        # dynamic_local_bias:
+        # Các token dùng để tính attention đầu ra (learnable)
         self.learnable_tokens = nn.Parameter(
             nn.init.trunc_normal_(torch.empty(num_heads, self.head_dim, self.local_len), mean=0, std=0.02))
         self.learnable_bias = nn.Parameter(torch.zeros(num_heads, 1, self.local_len))
@@ -78,49 +83,55 @@ class AggregatedAttention(nn.Module):
     def forward(self, x, H, W, relative_pos_index, relative_coords_table):
         B, N, C = x.shape
 
-        # Generate queries, normalize them with L2, add query embedding, and then magnify with sequence length scale and temperature.
-        # Use softplus function ensuring that the temperature is not lower than 0.
+        # Tính Q: normalize, cộng embedding, nhân nhiệt độ và log(seq_len)
         q_norm = F.normalize(self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3), dim=-1)
         q_norm_scaled = (q_norm + self.query_embedding) * F.softplus(self.temperature) * self.seq_length_scale
 
-        # Generate unfolded keys and values and l2-normalize them
+        # Tính K, V local: normalize và unfold để trích xuất vùng cửa sổ
         k_local, v_local = self.kv(x).chunk(2, dim=-1)
         k_local = F.normalize(k_local.reshape(B, N, self.num_heads, self.head_dim), dim=-1).reshape(B, N, -1)
         kv_local = torch.cat([k_local, v_local], dim=-1).permute(0, 2, 1).reshape(B, -1, H, W)
         k_local, v_local = self.unfold(kv_local).reshape(
             B, 2 * self.num_heads, self.head_dim, self.local_len, N).permute(0, 1, 4, 2, 3).chunk(2, dim=1)
 
-        # Compute local similarity
-        attn_local = ((q_norm_scaled.unsqueeze(-2) @ k_local).squeeze(-2) \
+        # Tính attention local (kết hợp thêm relative bias và mask)
+        attn_local = ((q_norm_scaled.unsqueeze(-2) @ k_local).squeeze(-2)
                       + self.relative_pos_bias_local.unsqueeze(1)).masked_fill(self.padding_mask, float('-inf'))
 
-        # Generate pooled features
-        x_ = x.permute(0, 2, 1).reshape(B, -1, H, W).contiguous()
+        # Tạo đặc trưng gộp không gian (pooled)
+        x_ = x.permute(0, 2, 1).reshape(B, -1, H, W)
         x_ = self.pool(self.act(self.sr(x_))).reshape(B, -1, self.pool_len).permute(0, 2, 1)
         x_ = self.norm(x_)
 
-        # Generate pooled keys and values
+        # Tính K, V pooled
         kv_pool = self.kv(x_).reshape(B, self.pool_len, 2 * self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         k_pool, v_pool = kv_pool.chunk(2, dim=1)
 
-        # Use MLP to generate continuous relative positional bias for pooled features.
+        # Tính bias vị trí liên tục cho phần pooled
         pool_bias = self.cpb_fc2(self.cpb_act(self.cpb_fc1(relative_coords_table))).transpose(0, 1)[:,
                     relative_pos_index.view(-1)].view(-1, N, self.pool_len)
-        # Compute pooled similarity
+
+        # Tính attention pooled
         attn_pool = q_norm_scaled @ F.normalize(k_pool, dim=-1).transpose(-2, -1) + pool_bias
 
-        # Concatenate local & pooled similarity matrices and calculate attention weights through the same Softmax
+        # Ghép attention local và pooled, softmax chung
         attn = torch.cat([attn_local, attn_pool], dim=-1).softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        # Split the attention weights and separately aggregate the values of local & pooled features
+        # Chia lại attention ra 2 nhánh: local và pooled
         attn_local, attn_pool = torch.split(attn, [self.local_len, self.pool_len], dim=-1)
-        x_local = (((q_norm @ self.learnable_tokens) + self.learnable_bias + attn_local).unsqueeze(
-            -2) @ v_local.transpose(-2, -1)).squeeze(-2)
+
+        # Tính output local bằng cách kết hợp attention, learnable bias và token học được
+        x_local = (((q_norm @ self.learnable_tokens) + self.learnable_bias + attn_local)
+                   .unsqueeze(-2) @ v_local.transpose(-2, -1)).squeeze(-2)
+
+        # Output từ attention pooled
         x_pool = attn_pool @ v_pool
+
+        # Tổng hợp lại output local + pooled
         x = (x_local + x_pool).transpose(1, 2).reshape(B, N, C)
 
-        # Linear projection and output
+        # Dự đoán cuối cùng (projection và dropout)
         x = self.proj(x)
         x = self.proj_drop(x)
 

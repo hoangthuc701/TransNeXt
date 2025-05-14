@@ -274,17 +274,21 @@ class TransNeXt(nn.Module):
             self.register_buffer(f"relative_pos_index{i + 1}", relative_pos_index, persistent=False)
             self.register_buffer(f"relative_coords_table{i + 1}", relative_coords_table, persistent=False)
 
+            # Đoạn code này tạo ra module chia ảnh thành patch chồng lấn (OverlapPatchEmbed) cho từng stage  i trong kiến trúc TransNeXt.
             patch_embed = OverlapPatchEmbed(patch_size=patch_size * 2 - 1 if i == 0 else 3,
                                             stride=patch_size if i == 0 else 2,
                                             in_chans=in_chans if i == 0 else embed_dims[i - 1],
                                             embed_dim=embed_dims[i])
 
+
+            # Attention + ConvGLU
             block = nn.ModuleList([Block(
                 dim=embed_dims[i], input_resolution=to_2tuple(img_size // (2 ** (i + 2))), window_size=window_size[i],
                 num_heads=num_heads[i], mlp_ratio=mlp_ratios[i], qkv_bias=qkv_bias,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[cur + j], norm_layer=norm_layer,
                 sr_ratio=sr_ratios[i], fixed_pool_size=fixed_pool_size)
                 for j in range(depths[i])])
+            #  lớp LayerNorm để chuẩn hóa đầu ra sau stage đó.
             norm = norm_layer(embed_dims[i])
             cur += depths[i]
 

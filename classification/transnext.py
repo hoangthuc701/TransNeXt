@@ -302,6 +302,7 @@ class TransNeXt(nn.Module):
         for n, m in self.named_modules():
             self._init_weights(m, n)
 
+    # Khởi tạo trọng số toàn bộ mô hình
     def _init_weights(self, m: nn.Module, name: str = ''):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)

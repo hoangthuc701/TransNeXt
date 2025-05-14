@@ -333,20 +333,27 @@ class TransNeXt(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
+    # Trích xuất đặc trưng (features) qua 4 stage
     def forward_features(self, x):
         B = x.shape[0]
 
         # Vòng lặp khởi tạo từng stage:
         for i in range(self.num_stages):
+            # 1. Lấy module theo stage:
             patch_embed = getattr(self, f"patch_embed{i + 1}")
             block = getattr(self, f"block{i + 1}")
             norm = getattr(self, f"norm{i + 1}")
+            # 2. Patch Embedding:
             x, H, W = patch_embed(x)
+            # 3. Lấy thông tin positional bias:
             relative_pos_index = getattr(self, f"relative_pos_index{i + 1}")
             relative_coords_table = getattr(self, f"relative_coords_table{i + 1}")
+            # 4. Chạy qua từng block trong stage:
             for blk in block:
                 x = blk(x, H, W, relative_pos_index, relative_coords_table)
+            # 5. Chuẩn hóa sau toàn bộ block:
             x = norm(x)
+            # 6. Reshape lại để đưa vào stage tiếp theo (nếu chưa phải stage cuối)
             if i != self.num_stages - 1:
                 x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
 

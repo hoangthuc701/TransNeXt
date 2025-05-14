@@ -71,6 +71,7 @@ class AggregatedAttention(nn.Module):
         self.window_size = window_size
         self.local_len = window_size ** 2
 
+        # 1. Tính toán kích thước pooling
         if fixed_pool_size is None:
             self.pool_H, self.pool_W = input_resolution[0] // self.sr_ratio, input_resolution[1] // self.sr_ratio
         else:
@@ -121,13 +122,16 @@ class AggregatedAttention(nn.Module):
 
         # Generate queries, normalize them with L2, add query embedding, and then magnify with sequence length scale and temperature.
         # Use softplus function ensuring that the temperature is not lower than 0.
+        # 2. Tạo Local Query (Q)
         q_norm = F.normalize(self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3), dim=-1)
         q_norm_scaled = (q_norm + self.query_embedding) * F.softplus(self.temperature) * self.seq_length_scale
 
+        # 3. Local Keys and Values
         # Generate unfolded keys and values and l2-normalize them
         k_local, v_local = self.kv(x).reshape(B, N, 2 * self.num_heads, self.head_dim).permute(0, 2, 1, 3).chunk(2,
                                                                                                                  dim=1)
 
+        # 4. Local attention with SW (sliding window)
         # Compute local similarity
         attn_local = sw_qkrpb_cuda.apply(q_norm_scaled.contiguous(), F.normalize(k_local, dim=-1).contiguous(),
                                          self.relative_pos_bias_local,

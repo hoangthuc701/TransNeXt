@@ -260,10 +260,15 @@ class TransNeXt(nn.Module):
         for i in range(num_stages):
             # Tạo bảng vị trí tương đối cho mỗi stage
             # Generate relative positional coordinate table and index for each stage to compute continuous relative positional bias.
+            # relative_pos_index: ánh xạ chỉ số từ tọa độ
+            # relative_coords_table: bảng bias liên tục (continuous relative positional encoding)
             relative_pos_index, relative_coords_table = get_relative_position_cpb(
+                # Kích thước của feature map sau khi chia ảnh đầu vào thành patch và đi qua i stage.
                 query_size=to_2tuple(img_size // (2 ** (i + 2))),
+                # Kích thước của Key sau khi downsample (pooling).
                 key_size=to_2tuple(img_size // ((2 ** (i + 2)) * sr_ratios[i])) if (
                         fixed_pool_size is None or sr_ratios[i] == 1) else to_2tuple(fixed_pool_size),
+                # Dùng kích thước ảnh ban đầu khi pretrain, sau khi chia down tương ứng 2^(i+2).
                 pretrain_size=to_2tuple(pretrain_size // (2 ** (i + 2))))
 
             self.register_buffer(f"relative_pos_index{i + 1}", relative_pos_index, persistent=False)
@@ -326,6 +331,7 @@ class TransNeXt(nn.Module):
     def forward_features(self, x):
         B = x.shape[0]
 
+        # Vòng lặp khởi tạo từng stage:
         for i in range(self.num_stages):
             patch_embed = getattr(self, f"patch_embed{i + 1}")
             block = getattr(self, f"block{i + 1}")
